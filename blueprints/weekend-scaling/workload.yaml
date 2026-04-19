@@ -1,93 +1,9 @@
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: weekend-scaler
-  namespace: default
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: weekend-scaler
-  namespace: default
-rules:
-- apiGroups: ["apps"]
-  resources: ["deployments", "deployments/scale"]
-  verbs: ["get", "list", "patch", "update"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: weekend-scaler
-  namespace: default
-subjects:
-- kind: ServiceAccount
-  name: weekend-scaler
-  namespace: default
-roleRef:
-  kind: Role
-  name: weekend-scaler
-  apiGroup: rbac.authorization.k8s.io
----
-# Scale the workload to 0 replicas every Friday at 18:00 UTC.
-# With no pending pods, Karpenter consolidation will drain and terminate nodes.
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: weekend-scale-down
-  namespace: default
-spec:
-  schedule: "0 18 * * 5"
-  concurrencyPolicy: Forbid
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          serviceAccountName: weekend-scaler
-          restartPolicy: OnFailure
-          containers:
-          - name: scaler
-            image: bitnami/kubectl:1.34
-            command:
-            - kubectl
-            - scale
-            - deployment/weekend-scaling-workload
-            - --replicas=0
-            - -n
-            - default
----
-# Restore replicas every Monday at 08:00 UTC so Karpenter provisions nodes again.
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: weekend-scale-up
-  namespace: default
-spec:
-  schedule: "0 8 * * 1"
-  concurrencyPolicy: Forbid
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          serviceAccountName: weekend-scaler
-          restartPolicy: OnFailure
-          containers:
-          - name: scaler
-            image: bitnami/kubectl:1.34
-            command:
-            - kubectl
-            - scale
-            - deployment/weekend-scaling-workload
-            - --replicas=5
-            - -n
-            - default
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: weekend-scaling-workload
   namespace: default
 spec:
-  replicas: 5
   selector:
     matchLabels:
       intent: weekend-scaling
@@ -118,3 +34,25 @@ spec:
         maxSkew: 1
         topologyKey: topology.kubernetes.io/zone
         whenUnsatisfiable: ScheduleAnyway
+---
+# KEDA manages the replica count via an HPA it creates internally.
+# During the active window (Mon 08:00 → Fri 18:00 UTC) the Deployment runs at
+# desiredReplicas. Outside that window KEDA scales it to minReplicaCount (0),
+# emptying the nodes so Karpenter's consolidation can terminate them.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: weekend-scaling-workload
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: weekend-scaling-workload
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  triggers:
+  - type: cron
+    metadata:
+      timezone: UTC
+      start: "0 8 * * 1"   # Monday 08:00 UTC — scale up to desiredReplicas
+      end: "0 18 * * 5"    # Friday 18:00 UTC — scale down to minReplicaCount (0)
+      desiredReplicas: "5"
