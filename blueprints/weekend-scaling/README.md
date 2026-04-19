@@ -130,7 +130,7 @@ KEDA creates an HPA targeting the `weekend-scaling-workload` Deployment and eval
 - type: prometheus
   metadata:
     serverAddress: "https://<<GRAFANA_CLOUD_PROMETHEUS_URL>>"
-    metricName: avg_memory_working_set_mib
+    authModes: "basic"
     threshold: "200"
     query: >-
       avg(container_memory_working_set_bytes{

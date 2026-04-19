@@ -92,9 +92,11 @@ spec:
   - type: prometheus
     metadata:
       serverAddress: "https://<<GRAFANA_CLOUD_PROMETHEUS_URL>>"
-      metricName: avg_memory_working_set_mib
-      # Target average memory per pod in MiB. Increase to tolerate higher memory
-      # before scaling out; decrease to scale out more aggressively.
+      # authModes must be declared here so KEDA knows to use basic auth
+      # when resolving the referenced TriggerAuthentication.
+      authModes: "basic"
+      # Target average memory per pod in MiB. KEDA computes ceil(metric / threshold)
+      # and picks max(cron_result, this_result) as the effective replica count.
       threshold: "200"
       query: >-
         avg(container_memory_working_set_bytes{
