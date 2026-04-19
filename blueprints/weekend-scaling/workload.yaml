@@ -1,3 +1,29 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-cloud-auth
+  namespace: default
+type: Opaque
+stringData:
+  username: "<<GRAFANA_CLOUD_INSTANCE_ID>>"
+  password: "<<GRAFANA_CLOUD_API_TOKEN>>"
+---
+# Grants KEDA access to the Grafana Cloud Prometheus endpoint using basic auth.
+# Grafana Cloud uses the numeric instance ID as username and an API token as password.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: grafana-cloud-auth
+  namespace: default
+spec:
+  secretTargetRef:
+  - parameter: username
+    name: grafana-cloud-auth
+    key: username
+  - parameter: password
+    name: grafana-cloud-auth
+    key: password
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -35,10 +61,14 @@ spec:
         topologyKey: topology.kubernetes.io/zone
         whenUnsatisfiable: ScheduleAnyway
 ---
-# KEDA manages the replica count via an HPA it creates internally.
-# During the active window (Mon 08:00 → Fri 18:00 UTC) the Deployment runs at
-# desiredReplicas. Outside that window KEDA scales it to minReplicaCount (0),
-# emptying the nodes so Karpenter's consolidation can terminate them.
+# KEDA evaluates all triggers and uses the highest resulting replica count.
+#
+# Cron trigger  — sets the baseline: 5 replicas on weekdays, 0 on weekends.
+# Prometheus trigger — scales up beyond the baseline when memory pressure is high.
+#
+# On weekends the cron window is closed (target: 0) and no pods are running, so
+# the Prometheus query returns no data. KEDA ignores triggers with no data by
+# default, leaving the cron result of 0 as the effective target.
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -48,11 +78,29 @@ spec:
   scaleTargetRef:
     name: weekend-scaling-workload
   minReplicaCount: 0
-  maxReplicaCount: 5
+  maxReplicaCount: 10
   triggers:
+  # Weekday baseline: 5 replicas Mon 08:00 → Fri 18:00 UTC; 0 outside that window.
   - type: cron
     metadata:
       timezone: UTC
-      start: "0 8 * * 1"   # Monday 08:00 UTC — scale up to desiredReplicas
-      end: "0 18 * * 5"    # Friday 18:00 UTC — scale down to minReplicaCount (0)
+      start: "0 8 * * 1"
+      end: "0 18 * * 5"
       desiredReplicas: "5"
+  # Memory-based scale-out: add replicas when average pod memory exceeds 200 MiB.
+  # KEDA computes ceil(metric / threshold) and picks max(cron_result, this_result).
+  - type: prometheus
+    metadata:
+      serverAddress: "https://<<GRAFANA_CLOUD_PROMETHEUS_URL>>"
+      metricName: avg_memory_working_set_mib
+      # Target average memory per pod in MiB. Increase to tolerate higher memory
+      # before scaling out; decrease to scale out more aggressively.
+      threshold: "200"
+      query: >-
+        avg(container_memory_working_set_bytes{
+          namespace="default",
+          container="app",
+          pod=~"weekend-scaling-workload-.*"
+        }) / 1024 / 1024
+    authenticationRef:
+      name: grafana-cloud-auth

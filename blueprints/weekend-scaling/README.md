@@ -6,6 +6,7 @@ For many teams, non-production workloads (staging, QA, development) run only dur
 
 1. **Karpenter disruption budgets** — block all voluntary disruptions during the workweek to protect workloads that cannot tolerate consolidation, and allow unrestricted consolidation over the weekend once nodes are empty.
 2. **KEDA cron scaler** — scale the workload `Deployment` to zero replicas on Friday evening and back up on Monday morning via a `ScaledObject`. Once no pods need to be scheduled, Karpenter's `WhenEmptyOrUnderutilized` consolidation policy terminates the now-empty nodes automatically.
+3. **KEDA Prometheus scaler (Grafana Cloud)** — scale out beyond the weekday baseline when average pod memory exceeds a configurable threshold, using metrics from Grafana Cloud's managed Prometheus.
 
 > **Why a workload scaler is needed**
 > Karpenter provisions and deprovisions nodes in response to pod demand. To reach zero nodes you must first reach zero running pods. KEDA drives that workload-level scale-down; Karpenter's consolidation then handles the node-level scale-down.
@@ -14,6 +15,10 @@ For many teams, non-production workloads (staging, QA, development) run only dur
 
 * A Kubernetes cluster with Karpenter installed. You can use the blueprint we've used to test this pattern at the cluster folder in the root of this repository.
 * [KEDA](https://keda.sh/docs/latest/deploy/) installed in the cluster (`helm install keda kedacore/keda --namespace keda`).
+* A [Grafana Cloud](https://grafana.com/products/cloud/) account with a managed Prometheus stack. You will need:
+  * The **Prometheus remote write endpoint URL** (e.g. `https://prometheus-prod-01-eu-west-0.grafana.net/api/prom`).
+  * The **numeric instance ID** of your Prometheus stack (used as the basic-auth username).
+  * A **Grafana Cloud API token** with `metrics:read` scope (used as the basic-auth password).
 * The `weekend-scaling-workload` `Deployment` (or a workload of your own) must have no [do-not-disrupt annotations](https://karpenter.sh/docs/concepts/disruption/#pod-level-controls) if you want nodes to drain fully.
 
 ## Deploy
@@ -27,11 +32,22 @@ export KARPENTER_NODE_IAM_ROLE_NAME=$(terraform -chdir="../../cluster/terraform"
 
 > ***NOTE***: If you're not using Terraform, you need to get those values manually. `CLUSTER_NAME` is the name of your EKS cluster (not the ARN). `KARPENTER_NODE_IAM_ROLE_NAME` is the IAM role name (not the ARN) that Karpenter uses to launch EC2 instances.
 
-Substitute the placeholders and deploy all resources:
+Set the Grafana Cloud variables alongside the cluster variables:
+
+```sh
+export GRAFANA_CLOUD_PROMETHEUS_URL=<your-prometheus-endpoint>   # e.g. prometheus-prod-01-eu-west-0.grafana.net/api/prom
+export GRAFANA_CLOUD_INSTANCE_ID=<your-numeric-instance-id>
+export GRAFANA_CLOUD_API_TOKEN=<your-api-token>
+```
+
+Substitute all placeholders and deploy:
 
 ```sh
 sed -i '' "s/<<CLUSTER_NAME>>/$CLUSTER_NAME/g" weekend-scaling.yaml
 sed -i '' "s/<<KARPENTER_NODE_IAM_ROLE_NAME>>/$KARPENTER_NODE_IAM_ROLE_NAME/g" weekend-scaling.yaml
+sed -i '' "s/<<GRAFANA_CLOUD_PROMETHEUS_URL>>/$GRAFANA_CLOUD_PROMETHEUS_URL/g" workload.yaml
+sed -i '' "s/<<GRAFANA_CLOUD_INSTANCE_ID>>/$GRAFANA_CLOUD_INSTANCE_ID/g" workload.yaml
+sed -i '' "s/<<GRAFANA_CLOUD_API_TOKEN>>/$GRAFANA_CLOUD_API_TOKEN/g" workload.yaml
 kubectl apply -f .
 ```
 
@@ -40,6 +56,8 @@ Expected output:
 ```console
 nodepool.karpenter.sh/weekend-scaling created
 ec2nodeclass.karpenter.k8s.aws/weekend-scaling created
+secret/grafana-cloud-auth created
+triggerauthentication.keda.sh/grafana-cloud-auth created
 deployment.apps/weekend-scaling-workload created
 scaledobject.keda.sh/weekend-scaling-workload created
 ```
@@ -93,10 +111,11 @@ The two budgets are mutually exclusive and cover the full week without overlap.
 
 ### KEDA ScaledObject
 
-KEDA creates an HPA targeting the `weekend-scaling-workload` Deployment. The `cron` trigger defines a single active window:
+KEDA creates an HPA targeting the `weekend-scaling-workload` Deployment and evaluates all triggers every polling interval, **taking the highest resulting replica count**.
+
+**Cron trigger** — defines the weekday baseline and the weekend zero:
 
 ```yaml
-triggers:
 - type: cron
   metadata:
     timezone: UTC
@@ -105,8 +124,33 @@ triggers:
     desiredReplicas: "5"
 ```
 
-Inside the window → KEDA sets replicas to `desiredReplicas` (5).  
-Outside the window → KEDA sets replicas to `minReplicaCount` (0).
+**Prometheus trigger** — scales out beyond the baseline when average pod memory exceeds the threshold:
+
+```yaml
+- type: prometheus
+  metadata:
+    serverAddress: "https://<<GRAFANA_CLOUD_PROMETHEUS_URL>>"
+    metricName: avg_memory_working_set_mib
+    threshold: "200"
+    query: >-
+      avg(container_memory_working_set_bytes{
+        namespace="default", container="app",
+        pod=~"weekend-scaling-workload-.*"
+      }) / 1024 / 1024
+  authenticationRef:
+    name: grafana-cloud-auth
+```
+
+KEDA computes `ceil(metric_value / threshold)` for the Prometheus trigger and keeps the maximum across all triggers:
+
+| Scenario | Cron result | Prometheus result | Effective replicas |
+|----------|------------|-------------------|-------------------|
+| Weekday, normal memory (150 MiB avg) | 5 | ceil(150/200) = 1 | **5** |
+| Weekday, high memory (600 MiB avg) | 5 | ceil(600/200) = 3 | **5** |
+| Weekday, very high memory (1200 MiB avg) | 5 | ceil(1200/200) = 6 | **6** |
+| Weekend, no pods running | 0 | no data → ignored | **0** |
+
+When pods are at zero over the weekend the Prometheus query returns no data. KEDA's default `noDataAction: ignore` means the trigger is skipped, leaving the cron result of 0 as the sole target.
 
 ### Scale-down flow (Friday evening)
 
@@ -163,6 +207,7 @@ The `workload.yaml` in this blueprint is a sample. To apply the weekend scaling 
 1. Ensure pods use `nodeSelector: intent: weekend-scaling` (or match the NodePool label via `nodeAffinity`).
 2. Create a `ScaledObject` for each `Deployment`, pointing `scaleTargetRef.name` at it and adjusting `desiredReplicas` / `maxReplicaCount` to match its normal weekday replica count.
 3. Remove `spec.replicas` from managed `Deployments` — KEDA owns the replica count and will override it.
+4. Update the Prometheus `query` to select pods belonging to your workload, and adjust `threshold` to the memory (in MiB) at which you want each additional replica to be provisioned.
 
 ## Clean-up
 
