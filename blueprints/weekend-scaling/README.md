@@ -78,11 +78,8 @@ disruption:
   consolidateAfter: 1m
   budgets:
   - nodes: "0"
-    schedule: "0 8 * * 1-5"
-    duration: 10h
-  - nodes: "20%"
-    schedule: "0 18 * * 1-5"
-    duration: 14h
+    schedule: "0 8 * * 1"
+    duration: 106h
   - nodes: "100%"
     schedule: "0 18 * * 5"
     duration: 62h
@@ -90,11 +87,10 @@ disruption:
 
 | Budget | When active | Effect |
 |--------|------------|--------|
-| `nodes: "0"` | Mon–Fri 08:00–18:00 UTC | No voluntary disruptions during business hours |
-| `nodes: "20%"` | Mon–Fri 18:00–08:00 UTC (evenings/nights) | Gradual consolidation outside business hours |
-| `nodes: "100%"` | Fri 18:00 → Mon 08:00 UTC (full weekend) | All empty nodes terminated simultaneously — no reason to throttle since replicas are already at zero |
+| `nodes: "0"` | Mon 08:00 → Fri 18:00 UTC (106 h) | No voluntary disruptions at all during the workweek — workloads that cannot tolerate consolidation (stateful services, strict PDBs, latency-sensitive apps) are fully protected |
+| `nodes: "100%"` | Fri 18:00 → Mon 08:00 UTC (62 h) | All empty nodes terminated simultaneously — safe because the CronJob has already scaled all replicas to zero before this window opens |
 
-Karpenter always applies the **most restrictive** budget when multiple are active. On weekends only the `100%` budget is in effect, so Karpenter can drain every node at once after the scale-down CronJob fires.
+The two budgets are mutually exclusive and cover the full week without overlap. Karpenter always applies the most restrictive budget when multiple are active simultaneously.
 
 ### Scale-down flow (Friday evening)
 

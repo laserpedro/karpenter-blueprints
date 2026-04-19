@@ -7,19 +7,15 @@ spec:
     consolidationPolicy: WhenEmptyOrUnderutilized
     consolidateAfter: 1m
     budgets:
-    # Block disruptions during business hours on weekdays (Mon–Fri 08:00–18:00 UTC)
-    # to protect workload availability during peak usage.
+    # Block ALL disruption during the workweek (Mon 08:00 → Fri 18:00 UTC).
+    # Workloads that cannot tolerate consolidation (e.g. stateful services,
+    # strict PDBs, or latency-sensitive apps) must never be disrupted mid-week.
     - nodes: "0"
-      schedule: "0 8 * * 1-5"
-      duration: 10h
-    # Allow up to 20% disruption during weekday off-hours (evenings/nights)
-    # to permit gradual consolidation without impacting any lingering workloads.
-    - nodes: "20%"
-      schedule: "0 18 * * 1-5"
-      duration: 14h
-    # Allow 100% disruption over the weekend (Fri 18:00 → Mon 08:00 UTC).
-    # All pods are already at zero replicas, so there is no reason to throttle
-    # node termination — this lets Karpenter drain every node simultaneously.
+      schedule: "0 8 * * 1"
+      duration: 106h
+    # Allow 100% disruption over the full weekend (Fri 18:00 → Mon 08:00 UTC).
+    # The CronJob has already scaled all replicas to zero, so every node is
+    # empty and can be terminated simultaneously with no workload impact.
     - nodes: "100%"
       schedule: "0 18 * * 5"
       duration: 62h
