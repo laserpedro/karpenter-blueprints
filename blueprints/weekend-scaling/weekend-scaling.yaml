@@ -12,9 +12,17 @@ spec:
     - nodes: "0"
       schedule: "0 8 * * 1-5"
       duration: 10h
-    # Allow up to 20% disruption at all other times (including weekends),
-    # so Karpenter can consolidate nodes once workloads are scaled to zero.
+    # Allow up to 20% disruption during weekday off-hours (evenings/nights)
+    # to permit gradual consolidation without impacting any lingering workloads.
     - nodes: "20%"
+      schedule: "0 18 * * 1-5"
+      duration: 14h
+    # Allow 100% disruption over the weekend (Fri 18:00 → Mon 08:00 UTC).
+    # All pods are already at zero replicas, so there is no reason to throttle
+    # node termination — this lets Karpenter drain every node simultaneously.
+    - nodes: "100%"
+      schedule: "0 18 * * 5"
+      duration: 62h
   limits:
     cpu: 1000
     memory: 1000Gi
