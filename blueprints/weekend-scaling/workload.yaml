@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-cloud-auth
+  namespace: default
+type: Opaque
+stringData:
+  username: "<<GRAFANA_CLOUD_INSTANCE_ID>>"
+  password: "<<GRAFANA_CLOUD_API_TOKEN>>"
+---
+# Grants KEDA access to the Grafana Cloud Prometheus endpoint using basic auth.
+# Grafana Cloud uses the numeric instance ID as username and an API token as password.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: grafana-cloud-auth
+  namespace: default
+spec:
+  secretTargetRef:
+  - parameter: username
+    name: grafana-cloud-auth
+    key: username
+  - parameter: password
+    name: grafana-cloud-auth
+    key: password
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weekend-scaling-workload
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      intent: weekend-scaling
+  template:
+    metadata:
+      labels:
+        intent: weekend-scaling
+    spec:
+      nodeSelector:
+        intent: weekend-scaling
+      containers:
+      - name: app
+        image: public.ecr.aws/eks-distro/kubernetes/pause:v1.33.0-eks-1-33-4
+        resources:
+          requests:
+            cpu: 512m
+            memory: 512Mi
+      topologySpreadConstraints:
+      - labelSelector:
+          matchLabels:
+            intent: weekend-scaling
+        maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - labelSelector:
+          matchLabels:
+            intent: weekend-scaling
+        maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+---
+# KEDA evaluates all triggers and uses the highest resulting replica count.
+#
+# Cron trigger  — sets the baseline: 5 replicas on weekdays, 0 on weekends.
+# Prometheus trigger — scales up beyond the baseline when memory pressure is high.
+#
+# On weekends the cron window is closed (target: 0) and no pods are running, so
+# the Prometheus query returns no data. KEDA ignores triggers with no data by
+# default, leaving the cron result of 0 as the effective target.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: weekend-scaling-workload
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: weekend-scaling-workload
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  triggers:
+  # Weekday baseline: 5 replicas Mon 08:00 → Fri 18:00 UTC; 0 outside that window.
+  - type: cron
+    metadata:
+      timezone: UTC
+      start: "0 8 * * 1"
+      end: "0 18 * * 5"
+      desiredReplicas: "5"
+  # Memory-based scale-out: add replicas when average pod memory exceeds 200 MiB.
+  # KEDA computes ceil(metric / threshold) and picks max(cron_result, this_result).
+  - type: prometheus
+    metadata:
+      serverAddress: "https://<<GRAFANA_CLOUD_PROMETHEUS_URL>>"
+      # authModes must be declared here so KEDA knows to use basic auth
+      # when resolving the referenced TriggerAuthentication.
+      authModes: "basic"
+      # Target average memory per pod in MiB. KEDA computes ceil(metric / threshold)
+      # and picks max(cron_result, this_result) as the effective replica count.
+      threshold: "200"
+      query: >-
+        avg(container_memory_working_set_bytes{
+          namespace="default",
+          container="app",
+          pod=~"weekend-scaling-workload-.*"
+        }) / 1024 / 1024
+    authenticationRef:
+      name: grafana-cloud-auth
