@@ -44,10 +44,12 @@ kubectl apply -f .
 Those commands creates the following:
 1. `EC2NodeClass` and `NodePool` named `soci-snapshotter` for using SOCI snapshotter parallel pull/unpack mode with customized `blockDeviceMappings` for increased I/O and storage size on Amazon Linux 2023.
 2. `EC2NodeClass` and `NodePool` named `soci-snapshotter-br` for using SOCI snapshotter parallel pull/unpack mode with customized `blockDeviceMappings` for increased I/O and storage size on Bottlerocket.
-3. `EC2NodeClass` and `NodePool` named `non-soci-snapshotter` for using default containerd implementation with customized `blockDeviceMappings` for increased I/O and storage size.
-4. Kubernetes `Deployment` named `vllm-soci` that uses the `soci-snapshotter` `NodePool`
-5. Kubernetes `Deployment` named `vllm-soci-br` that uses the `soci-snapshotter-br` `NodePool`
-6. Kubernetes `Deployment` named `vllm` that uses the `non-soci-snapshotter` `NodePool`
+3. `EC2NodeClass` and `NodePool` named `soci-snapshotter-br-c6-32xl` for using SOCI snapshotter parallel pull/unpack mode on Bottlerocket, tuned for `c6.32xlarge` instances pulling massive container images.
+4. `EC2NodeClass` and `NodePool` named `non-soci-snapshotter` for using default containerd implementation with customized `blockDeviceMappings` for increased I/O and storage size.
+5. Kubernetes `Deployment` named `vllm-soci` that uses the `soci-snapshotter` `NodePool`
+6. Kubernetes `Deployment` named `vllm-soci-br` that uses the `soci-snapshotter-br` `NodePool`
+7. Kubernetes `Deployment` named `vllm-soci-br-c6-32xl` that uses the `soci-snapshotter-br-c6-32xl` `NodePool`
+8. Kubernetes `Deployment` named `vllm` that uses the `non-soci-snapshotter` `NodePool`
 
 > ***NOTE***: For our example both deployments will request instances that have network and ebs bandwidth greater than 8000 Mbps by using `nodeAffinity` in order to eliminate network and storage I/O bottlenecks to demonstrate SOCI parallel mode capabilities.
 ```
@@ -141,6 +143,33 @@ SOCI parallel mode configuration is controlled by several key settings. While th
 4. `discard_unpacked_layers`: Controls whether to retain layer blobs after unpacking. Enabling this can reduce disk space usage and speed up pull times. Default is false for Bottlerocket and true for AL2023. We recommend to set this to true on EKS nodes.
 
 To learn more about other configuration options, visit the [official SOCI snapshotter doc](https://github.com/awslabs/soci-snapshotter/blob/main/docs/parallel-mode.md#configuration)
+
+### Optimized configuration for `c6.32xlarge` (Bottlerocket)
+
+`c6.32xlarge` instances offer 128 vCPUs and 50 Gbps network bandwidth, making them well-suited for pulling massive container images (30 GB+). The standard Bottlerocket defaults leave significant capacity unused. The following tuning values are recommended:
+
+| Parameter | Default (Bottlerocket) | General recommendation | c6.32xlarge recommendation |
+|---|---|---|---|
+| `concurrent-download-chunk-size` | `"unlimited"` | `"16mb"` | **`"32mb"`** |
+| `max-concurrent-downloads-per-image` | `3` | `20` | **`25`** |
+| `max-concurrent-unpacks-per-image` | `1` | `12` | **`32`** |
+| `discard-unpacked-layers` | `false` | `true` | **`true`** |
+
+**`concurrent-download-chunk-size = "32mb"`** — Doubling the chunk size from the general `"16mb"` recommendation reduces total HTTP request overhead for large layers (often 200 MB–2 GB in LLM images). Each range request carries twice the data, improving throughput-per-connection efficiency on the 50 Gbps link. The 128 vCPUs and 256 GiB RAM make the larger in-flight buffers insignificant.
+
+**`max-concurrent-downloads-per-image = 25`** — The additional 5 concurrent layer downloads take advantage of the 50 Gbps network headroom without approaching ECR's per-client connection limits.
+
+**`max-concurrent-unpacks-per-image = 32`** — Large LLM images commonly contain 30–50 layers. Setting this to 32 keeps the CPU pipeline saturated with decompression work, reducing the gap between download completion and container readiness. The 128 vCPUs on `c6.32xlarge` absorb this easily.
+
+The `NodePool` for this configuration constrains scheduling to `c6.32xlarge` only using `instance-generation: "6"` and `instance-size: 32xlarge` requirements alongside `instance-category: c`.
+
+```yaml
+[settings.container-runtime-plugins.soci-snapshotter.parallel-pull-unpack]
+max-concurrent-downloads-per-image = 25
+concurrent-download-chunk-size = "32mb"
+max-concurrent-unpacks-per-image = 32
+discard-unpacked-layers = true
+```
 
 As installing a snapshotter to containerd and EKS requires several configuration, this is all being done for you automatically in AL2023 and Bottlerocket as SOCI is already pre-installed in the latest AMIs.
 
