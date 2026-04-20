@@ -69,23 +69,24 @@ Those commands creates the following:
 ```
 ## Configuration
 
-The SOCI snapshotter `EC2NodeClass` configuration have several configuration parameters that affect SOCI parallel mode performance.
+The `EC2NodeClass` configuration for this blueprint has two parts: the **storage subsystem** (`blockDeviceMappings` and `instanceStorePolicy`) and the **SOCI parallel mode parameters** (`userData`). Both must be tuned together — fast downloads are useless if disk writes can't keep up, and fast storage is wasted if downloads are serialised.
 
-The `blockDeviceMapping` field is used to increase root volume EBS performance and storage size. The `instanceStorePolicy: RAID0` tells Karpenter to automatically configure a `RAID-0` array from all available NVMe instance store disks on the node. It then moves `/var/lib/containerd`, `/var/lib/kubelet`, and `/var/log/pods` to that array and symlinks them back.
-As SOCI parallel mode downloads layers, it buffers them on disk instead of in-memory, having a high performant storage subsystem is crucial to support it as well as enough storage to hold the container images.
-The example configure the root volume with IOPs of 16,000 and throughput of 1,000MiB/s which is the maximum for GP3, it is recommended that you modify those settings accordingly to trade-off between performance and cost.
-> ***NOTE***: From our benchmarks, we have also seen a good starting point by setting the throughput to 600MiB/s and keeping base IOPs to 3,000.
+### Storage subsystem
+
+SOCI parallel mode buffers each layer chunk to disk as it arrives rather than holding it in memory. The storage subsystem must be able to absorb concurrent write bursts from all active downloads.
+
+`instanceStorePolicy: RAID0` tells Karpenter to automatically stripe all available NVMe instance store disks into a single RAID-0 array on launch. Karpenter then moves `/var/lib/containerd`, `/var/lib/kubelet`, and `/var/log/pods` onto that array and symlinks them back. NVMe instance store achieves sequential write speeds of 3–10 GB/s depending on instance size, which is far above what EBS can provide and removes storage as the bottleneck for large images.
+
+When no NVMe disks are present (e.g. `c6i`, `c6a` without the `d` suffix), `instanceStorePolicy: RAID0` is a no-op and EBS becomes the sole write path. The example configures the container volume as gp3 at the maximum of 16,000 IOPS and 1,000 MiB/s throughput. For cost-sensitive workloads where the full 50 Gbps network is not being used, 3,000 IOPS and 600 MiB/s is a practical starting point.
 
 <details>
-<summary>Amazon Linux 2023</summary>
+<summary>Amazon Linux 2023 — block device configuration</summary>
 
 ```yaml
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
   name: soci-snapshotter
-...
-...
 spec:
   instanceStorePolicy: RAID0
   blockDeviceMappings:
@@ -95,22 +96,19 @@ spec:
       volumeType: gp3
       throughput: 1000
       iops: 16000
-...
-...
 ```
 </details>
-<details>
-<summary>Bottlerocket</summary>
 
-Bottlerocket defaults to two block devices, one for Bottlerocket's control volume and the other for container resources such as images and logs, in the example below we have configured Bottlerocket's secondary block device with increased EBS storage & throughput to support SOCI parallel mode.
+<details>
+<summary>Bottlerocket — block device configuration</summary>
+
+Bottlerocket uses two block devices: `/dev/xvda` is the read-only control volume (OS, settings) and `/dev/xvdb` is the container data volume (images, logs, SOCI data). Only `xvdb` needs the performance settings.
 
 ```yaml
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
   name: soci-snapshotter-br
-...
-...
 spec:
   instanceStorePolicy: RAID0
   blockDeviceMappings:
@@ -126,50 +124,138 @@ spec:
         throughput: 1000
         iops: 16000
         encrypted: true
-...
-...
 ```
 
+On Bottlerocket, SOCI stores its working data at `/var/lib/soci-snapshotter`. To redirect that path onto instance store (NVMe) when available, the bootstrap command binds it to ephemeral storage:
+
+```toml
+[settings.bootstrap-commands.k8s-ephemeral-storage]
+commands = [
+    ["apiclient", "ephemeral-storage", "init"],
+    ["apiclient", "ephemeral-storage", "bind", "--dirs", "/var/lib/soci-snapshotter"]
+]
+essential = true
+mode = "always"
+```
 </details>
+
 <br>
 
-The `userData` field is used to enable and configure SOCI snapshotter on AL2023 and Bottlerocket.
+### SOCI parallel mode parameters
 
-SOCI parallel mode configuration is controlled by several key settings. While the default values align with containerd's standard configuration to ensure stability and safety, you can adjust these parameters to optimize performance based on your specific needs, but ensure the infastructure can support it.
+The four parameters below sit in the `userData` field and control how SOCI downloads and unpacks image layers. Each parameter maps to a specific hardware resource. Understanding which resource is the bottleneck on a given instance type is the key to choosing the right values.
 
-1. `max_concurrent_downloads_per_image`: Limits the maximum concurrent downloads per individual image, Default is 3 for Bottlerocket and 20 for AL2023. For images hosted on Amazon ECR we recommend setting this to 10-20.
-2. `max_concurrent_unpacks_per_image`: Sets the limit for concurrent unpacking of layers per image. Default is 1 for Bottlerocket and 12 for AL2023. Tuning this to match the number of avg layers count of your container images.
-3. `concurrent_download_chunk_size`: Specifies the size of each download chunk when pulling image layers in parallel. Default is "unlimited" for Bottlerocket and "16mb" for AL2023. This feature will enable multiple concurrent downloads per layer, we recommend setting this value to >0 if your registry support HTTP range requests, if you're using ECR, we recommend setting this to "16mb".
-4. `discard_unpacked_layers`: Controls whether to retain layer blobs after unpacking. Enabling this can reduce disk space usage and speed up pull times. Default is false for Bottlerocket and true for AL2023. We recommend to set this to true on EKS nodes.
+---
 
-To learn more about other configuration options, visit the [official SOCI snapshotter doc](https://github.com/awslabs/soci-snapshotter/blob/main/docs/parallel-mode.md#configuration)
+#### `concurrent_download_chunk_size`
 
-### Optimized configuration for `c6.32xlarge` (Bottlerocket)
+**What it does:** SOCI splits each layer into fixed-size chunks and issues each chunk as a separate HTTP range request to the registry. This parameter sets the chunk size. A non-zero value enables *intra-layer parallelism* — multiple parts of the same layer are in-flight simultaneously, on top of the cross-layer parallelism provided by `max_concurrent_downloads_per_image`.
 
-`c6.32xlarge` instances offer 128 vCPUs and 50 Gbps network bandwidth, making them well-suited for pulling massive container images (30 GB+). The standard Bottlerocket defaults leave significant capacity unused. The following tuning values are recommended:
+Setting this to `"unlimited"` (the Bottlerocket default) disables chunking entirely: the whole layer is fetched as a single request with no intra-layer parallelism.
 
-| Parameter | Default (Bottlerocket) | General recommendation | c6.32xlarge recommendation |
-|---|---|---|---|
-| `concurrent-download-chunk-size` | `"unlimited"` | `"16mb"` | **`"32mb"`** |
-| `max-concurrent-downloads-per-image` | `3` | `20` | **`25`** |
-| `max-concurrent-unpacks-per-image` | `1` | `12` | **`32`** |
-| `discard-unpacked-layers` | `false` | `true` | **`true`** |
+**The trade-off between chunk size and HTTP overhead:**
 
-**`concurrent-download-chunk-size = "32mb"`** — Doubling the chunk size from the general `"16mb"` recommendation reduces total HTTP request overhead for large layers (often 200 MB–2 GB in LLM images). Each range request carries twice the data, improving throughput-per-connection efficiency on the 50 Gbps link. The 128 vCPUs and 256 GiB RAM make the larger in-flight buffers insignificant.
+Each range request carries fixed overhead regardless of payload size: a TCP connection (or reuse from the pool), a TLS record, HTTP headers, and ECR's per-request auth token evaluation on the server side. Smaller chunks create more requests and therefore more overhead per byte transferred. Larger chunks reduce overhead but reduce the number of concurrent in-flight requests per layer.
 
-**`max-concurrent-downloads-per-image = 25`** — The additional 5 concurrent layer downloads take advantage of the 50 Gbps network headroom without approaching ECR's per-client connection limits.
-
-**`max-concurrent-unpacks-per-image = 32`** — Large LLM images commonly contain 30–50 layers. Setting this to 32 keeps the CPU pipeline saturated with decompression work, reducing the gap between download completion and container readiness. The 128 vCPUs on `c6.32xlarge` absorb this easily.
-
-The `NodePool` for this configuration constrains scheduling to `c6.32xlarge` only using `instance-generation: "6"` and `instance-size: 32xlarge` requirements alongside `instance-category: c`.
-
-```yaml
-[settings.container-runtime-plugins.soci-snapshotter.parallel-pull-unpack]
-max-concurrent-downloads-per-image = 25
-concurrent-download-chunk-size = "32mb"
-max-concurrent-unpacks-per-image = 32
-discard-unpacked-layers = true
 ```
+Layer A (200 MB) with "16mb" chunks  →  ~13 range requests per layer
+Layer A (200 MB) with "32mb" chunks  →  ~7 range requests per layer
+Same total data transferred; ~46% fewer connections with "32mb"
+```
+
+**How the instance network bandwidth shifts the optimum:**
+
+On a **bandwidth-constrained instance** (≤ 25 Gbps), the network link is the bottleneck. Many small concurrent requests keep the pipe saturated and the per-request overhead is an acceptable price to pay for maximum parallelism.
+
+On a **high-bandwidth instance** (≥ 50 Gbps), the link is no longer the constraint. The pipe can be saturated with fewer, larger requests. At that point the overhead of hundreds of simultaneous small HTTP connections becomes measurable: more kernel socket buffers, more ECR-side connection handling, more goroutine scheduling in the SOCI runtime. Larger chunks deliver the same throughput with lower overhead.
+
+| Instance network bandwidth | Recommended value | Rationale |
+|---|---|---|
+| Up to 25 Gbps (e.g. `c5.9xlarge`, `m5.8xlarge`) | `"16mb"` | Maximise concurrent requests to saturate the link |
+| 25 Gbps (e.g. `c5.18xlarge`, `m5.24xlarge`) | `"16mb"` | ECR-optimised sweet spot at this bandwidth tier |
+| 50 Gbps (e.g. `c6i.32xlarge`, `m6i.32xlarge`) | `"32mb"` | Halves connection count; link still saturated with larger payloads |
+
+> **Defaults:** `"unlimited"` (Bottlerocket) — disables intra-layer parallelism entirely. `"16mb"` (AL2023). Always set an explicit value when your registry supports HTTP range requests; ECR does.
+
+> **Upper bound:** Avoid values above `"64mb"`. Very large chunks increase per-chunk memory allocations and cause longer stalls when a single chunk request is slow due to ECR jitter, since the entire layer waits for that one request to complete.
+
+---
+
+#### `max_concurrent_downloads_per_image`
+
+**What it does:** Sets the maximum number of layers that are downloaded simultaneously for a single image. This is the primary lever for cross-layer parallelism.
+
+**The trade-off:** Higher concurrency keeps more of the available network bandwidth in use and reduces the time spent waiting for layers to arrive sequentially. However, each active download holds an open TCP connection to ECR, consumes kernel socket buffer memory, and requires a goroutine for scheduling. Beyond a certain point, adding more concurrent downloads does not increase throughput — it only increases connection overhead and risks triggering ECR rate-limiting.
+
+**How the instance type affects this:**
+
+Network bandwidth is the primary driver. More bandwidth means more bytes can be delivered per second, which means more concurrent layer downloads can run without each connection starving the others. vCPU count is a secondary factor: each download goroutine requires a small amount of CPU; on instances with fewer than 16 vCPUs a very high value can create scheduling contention.
+
+| Instance vCPUs / Network | Recommended value | Notes |
+|---|---|---|
+| 4–32 vCPUs, ≤ 10 Gbps | `10–15` | Keep connection count low to avoid saturation |
+| 32–64 vCPUs, 10–25 Gbps | `20` | ECR-optimised baseline |
+| 64–96 vCPUs, 25–50 Gbps | `20–25` | Modest increase to use additional bandwidth headroom |
+| 128 vCPUs, 50 Gbps (e.g. `c6i.32xlarge`) | `25` | Further headroom without approaching ECR per-client limits |
+
+> **Defaults:** `3` (Bottlerocket), `20` (AL2023). The Bottlerocket default of 3 serialises almost all download work — always increase this.
+
+> **Ceiling:** ECR is designed for 20–30 concurrent connections per client. Values above `30` are unlikely to improve throughput and may cause throttled responses.
+
+---
+
+#### `max_concurrent_unpacks_per_image`
+
+**What it does:** Sets the maximum number of layers being decompressed and written to disk simultaneously. Unpacking happens as soon as each layer's download is complete — a high value keeps the CPU pipeline busy with decompression while the next set of layers is still downloading.
+
+**The trade-off:** Unpacking is CPU-bound (gzip or zstd decompression) and I/O-bound (writing decompressed data to the container volume). More concurrency reduces wall-clock time from download-complete to container-ready, but each concurrent unpack occupies one CPU core for decompression and one I/O queue slot for writing. Setting this above the vCPU count wastes scheduling overhead; setting it above the storage write bandwidth saturates the disk.
+
+The number of layers in the image sets a practical ceiling: unpacking 64 layers concurrently on a 20-layer image gains nothing after the 20th slot.
+
+**How the instance type affects this:**
+
+vCPU count is the primary driver. Storage write throughput is the secondary driver. On instances backed by gp3 EBS (max 1,000 MiB/s), even a moderate number of concurrent unpacks can saturate the write path; on instances with NVMe RAID-0, the storage ceiling is much higher.
+
+| Instance vCPUs / Storage | Recommended value | Notes |
+|---|---|---|
+| 4–16 vCPUs, EBS gp3 | `8–12` | Avoid overwhelming EBS write bandwidth |
+| 16–64 vCPUs, EBS gp3 | `12–20` | EBS remains the ceiling; CPUs are available |
+| 64–96 vCPUs, NVMe RAID-0 | `20–24` | NVMe removes storage ceiling; match to layer count |
+| 128 vCPUs, NVMe or high-IOPS EBS (e.g. `c6i.32xlarge`) | `32` | Matches typical LLM image layer count (30–50 layers) |
+
+> **Defaults:** `1` (Bottlerocket), `12` (AL2023). A Bottlerocket default of 1 fully serialises decompression — always increase this.
+
+---
+
+#### `discard_unpacked_layers`
+
+**What it does:** After a layer is downloaded and unpacked, SOCI can delete the original compressed blob. When set to `true`, only the unpacked (uncompressed) filesystem data is kept; the downloaded blob is discarded immediately.
+
+**The trade-off:**
+
+- `true` reduces peak disk usage. Without this setting, the node must hold both the compressed blob and the uncompressed unpacked data at the same time during the pull. For a 10 GB image that expands to 25 GB uncompressed, `false` requires up to 35 GB of transient disk space.
+- `true` also reduces total disk write volume: the blob does not need to be written and then read back during unpack.
+- `false` retains the blob, which is only useful if the same image will be pulled repeatedly from a local on-disk cache on the same node. On EKS with Karpenter, nodes are regularly replaced, so there is no long-term caching benefit.
+
+**How the instance type affects this:** This parameter is not instance-type dependent. On any EKS node managed by Karpenter, set this to `true`.
+
+> **Defaults:** `false` (Bottlerocket), `true` (AL2023).
+
+---
+
+### Tuning by instance profile
+
+The table below summarises the recommended values for the most common instance profiles. These assume ECR as the registry and gp3 EBS at maximum throughput as the storage backend (or NVMe RAID-0 where available).
+
+| Instance profile | Network | vCPUs | `concurrent_download_chunk_size` | `max_concurrent_downloads` | `max_concurrent_unpacks` | `discard_unpacked_layers` |
+|---|---|---|---|---|---|---|
+| General (c5/m5/r5, up to 8xlarge) | ≤ 25 Gbps | 4–32 | `"16mb"` | `20` | `12` | `true` |
+| Large (c5.18xl, m5.24xl, r5.24xl) | 25 Gbps | 72–96 | `"16mb"` | `20` | `20` | `true` |
+| c6/m6/r6 32xlarge | 50 Gbps | 128 | `"32mb"` | `25` | `32` | `true` |
+
+For the `c6.32xlarge` profile, a dedicated `EC2NodeClass` (`soci-snapshotter-br-c6-32xl`) and `NodePool` are provided in this blueprint. The `NodePool` uses `instance-generation: "6"` and `instance-size: 32xlarge` alongside `instance-category: c` to pin scheduling to exactly this instance shape.
+
+To learn more about all available configuration options, visit the [official SOCI snapshotter documentation](https://github.com/awslabs/soci-snapshotter/blob/main/docs/parallel-mode.md#configuration).
 
 As installing a snapshotter to containerd and EKS requires several configuration, this is all being done for you automatically in AL2023 and Bottlerocket as SOCI is already pre-installed in the latest AMIs.
 
