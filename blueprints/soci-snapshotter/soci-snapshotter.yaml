@@ -172,6 +172,287 @@ spec:
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
+  name: soci-snapshotter-br-c6-32xl
+spec:
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  role: "<<KARPENTER_NODE_IAM_ROLE_NAME>>"
+  instanceStorePolicy: RAID0
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 4Gi
+        volumeType: gp3
+        encrypted: true
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        throughput: 1000
+        iops: 16000
+        encrypted: true
+  securityGroupSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: "<<CLUSTER_NAME>>"
+  subnetSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: "<<CLUSTER_NAME>>"
+  userData: |
+    [settings.container-runtime]
+    snapshotter = "soci"
+
+    [settings.container-runtime-plugins.soci-snapshotter]
+    pull-mode = "parallel-pull-unpack"
+
+    [settings.container-runtime-plugins.soci-snapshotter.parallel-pull-unpack]
+    max-concurrent-downloads-per-image = 25
+    concurrent-download-chunk-size = "32mb"
+    max-concurrent-unpacks-per-image = 32
+    discard-unpacked-layers = true
+
+    [settings.bootstrap-commands.k8s-ephemeral-storage]
+    commands = [
+        ["apiclient", "ephemeral-storage", "init"],
+        ["apiclient", "ephemeral-storage" ,"bind", "--dirs", "/var/lib/soci-snapshotter"]
+    ]
+    essential = true
+    mode = "always"
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: soci-snapshotter-br-c6-32xl
+spec:
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 5m
+  template:
+    metadata:
+      labels:
+        intent: soci-snapshotter-br-c6-32xl
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: soci-snapshotter-br-c6-32xl
+      requirements:
+      - key: kubernetes.io/os
+        operator: In
+        values:
+        - linux
+      - key: karpenter.k8s.aws/instance-category
+        operator: In
+        values:
+        - c
+      - key: karpenter.k8s.aws/instance-generation
+        operator: In
+        values:
+        - "6"
+      - key: karpenter.k8s.aws/instance-size
+        operator: In
+        values:
+        - 32xlarge
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - amd64
+      - key: karpenter.sh/capacity-type
+        operator: In
+        values:
+        - spot
+        - on-demand
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: soci-snapshotter-br-p5
+spec:
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  role: "<<KARPENTER_NODE_IAM_ROLE_NAME>>"
+  instanceStorePolicy: RAID0
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 4Gi
+        volumeType: gp3
+        encrypted: true
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        throughput: 1000
+        iops: 16000
+        encrypted: true
+  securityGroupSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: "<<CLUSTER_NAME>>"
+  subnetSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: "<<CLUSTER_NAME>>"
+  userData: |
+    [settings.container-runtime]
+    snapshotter = "soci"
+
+    [settings.container-runtime-plugins.soci-snapshotter]
+    pull-mode = "parallel-pull-unpack"
+
+    [settings.container-runtime-plugins.soci-snapshotter.parallel-pull-unpack]
+    max-concurrent-downloads-per-image = 30
+    concurrent-download-chunk-size = "32mb"
+    max-concurrent-unpacks-per-image = 48
+    discard-unpacked-layers = true
+
+    [settings.bootstrap-commands.k8s-ephemeral-storage]
+    commands = [
+        ["apiclient", "ephemeral-storage", "init"],
+        ["apiclient", "ephemeral-storage" ,"bind", "--dirs", "/var/lib/soci-snapshotter"]
+    ]
+    essential = true
+    mode = "always"
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: soci-snapshotter-br-p5
+spec:
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 5m
+  template:
+    metadata:
+      labels:
+        intent: soci-snapshotter-br-p5
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: soci-snapshotter-br-p5
+      requirements:
+      - key: kubernetes.io/os
+        operator: In
+        values:
+        - linux
+      - key: karpenter.k8s.aws/instance-category
+        operator: In
+        values:
+        - p
+      - key: karpenter.k8s.aws/instance-generation
+        operator: In
+        values:
+        - "5"
+      - key: karpenter.k8s.aws/instance-size
+        operator: In
+        values:
+        - 48xlarge
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - amd64
+      - key: karpenter.sh/capacity-type
+        operator: In
+        values:
+        - spot
+        - on-demand
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: soci-snapshotter-br-g6
+spec:
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  role: "<<KARPENTER_NODE_IAM_ROLE_NAME>>"
+  instanceStorePolicy: RAID0
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 4Gi
+        volumeType: gp3
+        encrypted: true
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        throughput: 1000
+        iops: 16000
+        encrypted: true
+  securityGroupSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: "<<CLUSTER_NAME>>"
+  subnetSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: "<<CLUSTER_NAME>>"
+  userData: |
+    [settings.container-runtime]
+    snapshotter = "soci"
+
+    [settings.container-runtime-plugins.soci-snapshotter]
+    pull-mode = "parallel-pull-unpack"
+
+    [settings.container-runtime-plugins.soci-snapshotter.parallel-pull-unpack]
+    max-concurrent-downloads-per-image = 25
+    concurrent-download-chunk-size = "32mb"
+    max-concurrent-unpacks-per-image = 32
+    discard-unpacked-layers = true
+
+    [settings.bootstrap-commands.k8s-ephemeral-storage]
+    commands = [
+        ["apiclient", "ephemeral-storage", "init"],
+        ["apiclient", "ephemeral-storage" ,"bind", "--dirs", "/var/lib/soci-snapshotter"]
+    ]
+    essential = true
+    mode = "always"
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: soci-snapshotter-br-g6
+spec:
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 5m
+  template:
+    metadata:
+      labels:
+        intent: soci-snapshotter-br-g6
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: soci-snapshotter-br-g6
+      requirements:
+      - key: kubernetes.io/os
+        operator: In
+        values:
+        - linux
+      - key: karpenter.k8s.aws/instance-category
+        operator: In
+        values:
+        - g
+      - key: karpenter.k8s.aws/instance-generation
+        operator: In
+        values:
+        - "6"
+      - key: karpenter.k8s.aws/instance-size
+        operator: In
+        values:
+        - 12xlarge
+        - 24xlarge
+        - 48xlarge
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - amd64
+      - key: karpenter.sh/capacity-type
+        operator: In
+        values:
+        - spot
+        - on-demand
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
   name: non-soci-snapshotter
 spec:
   amiSelectorTerms:
