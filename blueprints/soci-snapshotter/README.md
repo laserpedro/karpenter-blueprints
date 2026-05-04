@@ -45,11 +45,15 @@ Those commands creates the following:
 1. `EC2NodeClass` and `NodePool` named `soci-snapshotter` for using SOCI snapshotter parallel pull/unpack mode with customized `blockDeviceMappings` for increased I/O and storage size on Amazon Linux 2023.
 2. `EC2NodeClass` and `NodePool` named `soci-snapshotter-br` for using SOCI snapshotter parallel pull/unpack mode with customized `blockDeviceMappings` for increased I/O and storage size on Bottlerocket.
 3. `EC2NodeClass` and `NodePool` named `soci-snapshotter-br-c6-32xl` for using SOCI snapshotter parallel pull/unpack mode on Bottlerocket, tuned for `c6.32xlarge` instances pulling massive container images.
-4. `EC2NodeClass` and `NodePool` named `non-soci-snapshotter` for using default containerd implementation with customized `blockDeviceMappings` for increased I/O and storage size.
-5. Kubernetes `Deployment` named `vllm-soci` that uses the `soci-snapshotter` `NodePool`
-6. Kubernetes `Deployment` named `vllm-soci-br` that uses the `soci-snapshotter-br` `NodePool`
-7. Kubernetes `Deployment` named `vllm-soci-br-c6-32xl` that uses the `soci-snapshotter-br-c6-32xl` `NodePool`
-8. Kubernetes `Deployment` named `vllm` that uses the `non-soci-snapshotter` `NodePool`
+4. `EC2NodeClass` and `NodePool` named `soci-snapshotter-br-p5` for using SOCI snapshotter parallel pull/unpack mode on Bottlerocket, tuned for `p5.48xlarge` instances (NVIDIA H100, 192 vCPUs, 30 TB NVMe RAID-0).
+5. `EC2NodeClass` and `NodePool` named `soci-snapshotter-br-g6` for using SOCI snapshotter parallel pull/unpack mode on Bottlerocket, tuned for `g6.12xlarge`, `g6.24xlarge`, and `g6.48xlarge` instances (NVIDIA L4, NVMe RAID-0).
+6. `EC2NodeClass` and `NodePool` named `non-soci-snapshotter` for using default containerd implementation with customized `blockDeviceMappings` for increased I/O and storage size.
+7. Kubernetes `Deployment` named `vllm-soci` that uses the `soci-snapshotter` `NodePool`
+8. Kubernetes `Deployment` named `vllm-soci-br` that uses the `soci-snapshotter-br` `NodePool`
+9. Kubernetes `Deployment` named `vllm-soci-br-c6-32xl` that uses the `soci-snapshotter-br-c6-32xl` `NodePool`
+10. Kubernetes `Deployment` named `vllm-soci-br-p5` that uses the `soci-snapshotter-br-p5` `NodePool`
+11. Kubernetes `Deployment` named `vllm-soci-br-g6` that uses the `soci-snapshotter-br-g6` `NodePool`
+12. Kubernetes `Deployment` named `vllm` that uses the `non-soci-snapshotter` `NodePool`
 
 > ***NOTE***: For our example both deployments will request instances that have network and ebs bandwidth greater than 8000 Mbps by using `nodeAffinity` in order to eliminate network and storage I/O bottlenecks to demonstrate SOCI parallel mode capabilities.
 ```
@@ -173,7 +177,9 @@ On a **high-bandwidth instance** (≥ 50 Gbps), the link is no longer the constr
 |---|---|---|
 | Up to 25 Gbps (e.g. `c5.9xlarge`, `m5.8xlarge`) | `"16mb"` | Maximise concurrent requests to saturate the link |
 | 25 Gbps (e.g. `c5.18xlarge`, `m5.24xlarge`) | `"16mb"` | ECR-optimised sweet spot at this bandwidth tier |
-| 50 Gbps (e.g. `c6i.32xlarge`, `m6i.32xlarge`) | `"32mb"` | Halves connection count; link still saturated with larger payloads |
+| 50 Gbps (e.g. `c6i.32xlarge`, `g6.12xlarge`, `g6.24xlarge`) | `"32mb"` | Halves connection count; link still saturated with larger payloads |
+| 100 Gbps (e.g. `g6.48xlarge`) | `"32mb"` | Same reasoning; connection overhead reduction matters more at very high bandwidth |
+| EFA / 3,200 Gbps (e.g. `p5.48xlarge`) | `"32mb"` | EFA is for inter-node RDMA; ECR pulls use the standard VPC network path and behave like a high-bandwidth TCP link — same chunk size applies |
 
 > **Defaults:** `"unlimited"` (Bottlerocket) — disables intra-layer parallelism entirely. `"16mb"` (AL2023). Always set an explicit value when your registry supports HTTP range requests; ECR does.
 
@@ -196,7 +202,8 @@ Network bandwidth is the primary driver. More bandwidth means more bytes can be 
 | 4–32 vCPUs, ≤ 10 Gbps | `10–15` | Keep connection count low to avoid saturation |
 | 32–64 vCPUs, 10–25 Gbps | `20` | ECR-optimised baseline |
 | 64–96 vCPUs, 25–50 Gbps | `20–25` | Modest increase to use additional bandwidth headroom |
-| 128 vCPUs, 50 Gbps (e.g. `c6i.32xlarge`) | `25` | Further headroom without approaching ECR per-client limits |
+| 128 vCPUs, 50–100 Gbps (e.g. `c6i.32xlarge`, `g6.12/24xlarge`) | `25` | Further headroom without approaching ECR per-client limits |
+| 192 vCPUs, 100 Gbps+ (e.g. `g6.48xlarge`, `p5.48xlarge`) | `25–30` | At 192 vCPUs goroutine overhead is negligible; `30` sits at the ECR ceiling |
 
 > **Defaults:** `3` (Bottlerocket), `20` (AL2023). The Bottlerocket default of 3 serialises almost all download work — always increase this.
 
@@ -221,7 +228,8 @@ vCPU count is the primary driver. Storage write throughput is the secondary driv
 | 4–16 vCPUs, EBS gp3 | `8–12` | Avoid overwhelming EBS write bandwidth |
 | 16–64 vCPUs, EBS gp3 | `12–20` | EBS remains the ceiling; CPUs are available |
 | 64–96 vCPUs, NVMe RAID-0 | `20–24` | NVMe removes storage ceiling; match to layer count |
-| 128 vCPUs, NVMe or high-IOPS EBS (e.g. `c6i.32xlarge`) | `32` | Matches typical LLM image layer count (30–50 layers) |
+| 128 vCPUs, NVMe RAID-0 (e.g. `c6i.32xlarge`, `g6.12/24xlarge`) | `32` | Matches typical LLM image layer count (30–50 layers) |
+| 192 vCPUs, NVMe RAID-0 (e.g. `g6.48xlarge`, `p5.48xlarge`) | `48` | 30+ TB NVMe on p5 / 30 TB on g6.48xl saturates writes; 48 matches deep training image layer counts |
 
 > **Defaults:** `1` (Bottlerocket), `12` (AL2023). A Bottlerocket default of 1 fully serialises decompression — always increase this.
 
@@ -247,13 +255,15 @@ vCPU count is the primary driver. Storage write throughput is the secondary driv
 
 The table below summarises the recommended values for the most common instance profiles. These assume ECR as the registry and gp3 EBS at maximum throughput as the storage backend (or NVMe RAID-0 where available).
 
-| Instance profile | Network | vCPUs | `concurrent_download_chunk_size` | `max_concurrent_downloads` | `max_concurrent_unpacks` | `discard_unpacked_layers` |
-|---|---|---|---|---|---|---|
-| General (c5/m5/r5, up to 8xlarge) | ≤ 25 Gbps | 4–32 | `"16mb"` | `20` | `12` | `true` |
-| Large (c5.18xl, m5.24xl, r5.24xl) | 25 Gbps | 72–96 | `"16mb"` | `20` | `20` | `true` |
-| c6/m6/r6 32xlarge | 50 Gbps | 128 | `"32mb"` | `25` | `32` | `true` |
+| Instance profile | Network | vCPUs | NVMe RAID-0 | `concurrent_download_chunk_size` | `max_concurrent_downloads` | `max_concurrent_unpacks` | `discard_unpacked_layers` |
+|---|---|---|---|---|---|---|---|
+| General (c5/m5/r5, up to 8xlarge) | ≤ 25 Gbps | 4–32 | No | `"16mb"` | `20` | `12` | `true` |
+| Large (c5.18xl, m5.24xl, r5.24xl) | 25 Gbps | 72–96 | No | `"16mb"` | `20` | `20` | `true` |
+| c6/m6/r6 32xlarge (`soci-snapshotter-br-c6-32xl`) | 50 Gbps | 128 | Optional (`d` suffix) | `"32mb"` | `25` | `32` | `true` |
+| g6 12xl/24xl/48xl (`soci-snapshotter-br-g6`) | 50–100 Gbps | 48–192 | Yes | `"32mb"` | `25` | `32` | `true` |
+| p5.48xlarge (`soci-snapshotter-br-p5`) | EFA / high TCP | 192 | Yes (30 TB) | `"32mb"` | `30` | `48` | `true` |
 
-For the `c6.32xlarge` profile, a dedicated `EC2NodeClass` (`soci-snapshotter-br-c6-32xl`) and `NodePool` are provided in this blueprint. The `NodePool` uses `instance-generation: "6"` and `instance-size: 32xlarge` alongside `instance-category: c` to pin scheduling to exactly this instance shape.
+Each optimized profile has a dedicated `EC2NodeClass` and `NodePool` in this blueprint. The `NodePool` for each uses `instance-category`, `instance-generation`, and where appropriate `instance-size` requirements to pin scheduling to exactly the intended instance shape.
 
 To learn more about all available configuration options, visit the [official SOCI snapshotter documentation](https://github.com/awslabs/soci-snapshotter/blob/main/docs/parallel-mode.md#configuration).
 
