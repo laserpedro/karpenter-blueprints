@@ -6,6 +6,11 @@
 # cluster and overlaps with the (SOCI-accelerated) pull of the inference image.
 # Running the download from EC2 user data is not an option: on AL2023 the RAID
 # array is assembled by nodeadm *after* cloud-init has run the user data scripts.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-preloader
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -27,6 +32,10 @@ spec:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      # Credentials come from the node instance profile by default. Associate an
+      # IAM role with this service account through EKS Pod Identity to scope S3
+      # access to the preloader only (see README).
+      serviceAccountName: model-preloader
       # Start before regular workloads so the weights are ready as early as possible.
       priorityClassName: system-node-critical
       terminationGracePeriodSeconds: 5

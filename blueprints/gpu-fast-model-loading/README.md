@@ -13,7 +13,7 @@ This blueprint shows how to configure a Karpenter `EC2NodeClass` and `NodePool` 
 * assemble the **local NVMe instance store into a RAID-0 array** that backs containerd, the SOCI snapshotter, kubelet (`emptyDir`) and pod logs, so the EBS root volume only hosts the OS,
 * **download model weights from Amazon S3 straight onto that NVMe array** with a `model-preloader` DaemonSet, in parallel with the image pull, and expose them to the inference pod through a `hostPath` volume.
 
-The pattern follows the AWS Containers blog post [Fast model loading for AI inference on Amazon EKS](https://aws.amazon.com/blogs/containers/fast-model-loading-for-ai-inference-on-amazon-eks/). It builds on the [SOCI snapshotter](/blueprints/soci-snapshotter/) and [NVIDIA GPU workload](/blueprints/nvidia-gpu-workload/) blueprints, which explain each building block in more depth.
+The pattern follows the AWS Containers blog post [Fast model loading for AI inference on Amazon EKS](https://aws.amazon.com/blogs/containers/fast-model-loading-for-ai-inference-on-amazon-eks/) and the EKS user guide page [Accelerate model loading on Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/ml-inference-fast-model-loading.html), which also covers the torch.compile cache and the Run:ai Model Streamer alternative described below. It builds on the [SOCI snapshotter](/blueprints/soci-snapshotter/) and [NVIDIA GPU workload](/blueprints/nvidia-gpu-workload/) blueprints, which explain each building block in more depth.
 
 ## Requirements
 
@@ -95,7 +95,15 @@ aws iam put-role-policy \
   }"
 ```
 
-> ***NOTE***: In production you may prefer to scope the permission to the DaemonSet's service account with [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html) instead of the node role. `s5cmd` uses the standard AWS SDK credential chain, so no change to the manifest is needed.
+> ***NOTE***: In production you may prefer to scope the permission to the workload instead of the node role. The `model-preloader` DaemonSet and both vLLM variants run under dedicated service accounts (`model-preloader`, `vllm-streamer`) so you can bind an IAM role to them with [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html), for example:
+>
+> ```sh
+> aws eks create-pod-identity-association --cluster-name "$CLUSTER_NAME" \
+>   --namespace default --service-account model-preloader \
+>   --role-arn arn:aws:iam::<account-id>:role/<model-read-role>
+> ```
+>
+> `s5cmd` and vLLM use the standard AWS SDK credential chain, so no change to the manifests is needed. The Pod Identity Agent add-on must be installed (it is when the cluster was created with the Terraform template in this repository).
 
 ### Apply the blueprint
 
@@ -105,6 +113,7 @@ Make sure you're in this blueprint folder, then replace the placeholders and app
 sed -i '' "s/<<CLUSTER_NAME>>/$CLUSTER_NAME/g" nodeclass.yaml
 sed -i '' "s/<<KARPENTER_NODE_IAM_ROLE_NAME>>/$KARPENTER_NODE_IAM_ROLE_NAME/g" nodeclass.yaml
 sed -i '' "s|<<MODEL_BUCKET>>|$MODEL_BUCKET|g" model-preloader.yaml
+sed -i '' "s|<<MODEL_BUCKET>>|$MODEL_BUCKET|g; s|<<MODEL_PATH>>|$MODEL_PATH|g" streamer/workload-streamer.yaml
 sed -i '' "s|<<MODEL_PATH>>|$MODEL_PATH|g" model-preloader.yaml workload.yaml
 kubectl apply -f .
 ```
@@ -116,7 +125,9 @@ Those commands create the following:
 1. `EC2NodeClass` named `gpu-fast-model-loading` with `instanceStorePolicy: RAID0` and the `FastImagePull` feature gate enabled (`nodeclass.yaml`).
 2. `NodePool` named `gpu-fast-model-loading` that only launches `p5`, `p5e` or `p5en` instances with local NVMe, tainted with `nvidia.com/gpu` (`nodepool.yaml`).
 3. `DaemonSet` named `model-preloader` that copies `s3://$MODEL_BUCKET/$MODEL_PATH/` onto the NVMe array of every node in that NodePool (`model-preloader.yaml`).
-4. `Deployment` and `Service` named `vllm` running the Amazon Deep Learning Container for vLLM and serving the model from the NVMe array (`workload.yaml`).
+4. `Deployment` and `Service` named `vllm` running the Amazon Deep Learning Container for vLLM and serving the model from the NVMe array, with its torch.compile cache on the same array (`workload.yaml`).
+
+The `streamer/` sub-folder holds an alternative workload that streams the weights from S3 straight into GPU memory (see [Alternative: stream weights with Run:ai Model Streamer](#alternative-stream-weights-with-runai-model-streamer)). It is not applied by `kubectl apply -f .` on purpose, since each variant claims a full `p5.48xlarge`.
 
 > ***NOTE***: It can take several minutes for a `p5.48xlarge` to launch, pull the ~10 GB image and download the weights. While waiting, you can follow the progress with `kubectl logs -l app=model-preloader -c s5cmd -f`.
 
@@ -247,6 +258,67 @@ To serve several models from the same pool, either run one `model-preloader` Dae
 * `/dev/shm` is an in-memory `emptyDir` because NCCL uses shared memory for tensor-parallel communication.
 * If you would rather not use `hostPath`, an `emptyDir` in the inference pod is also on the NVMe array (kubelet's pod directory is bind-mounted onto it) and can be filled by an init container with the same `s5cmd` command. You lose the overlap with the image pull and the reuse across pods on the same node, but avoid host-level access.
 
+#### torch.compile cache on the NVMe array
+
+vLLM compiles the model's computation graph with `torch.compile` on first start, which takes roughly one minute on a 60 to 140 GB model. The compiled kernels are small (tens of MB) and deterministic for a given GPU type, model, tensor-parallel degree and PyTorch version, so the workload points the cache at a second `hostPath` on the NVMe array and every later pod on the same node skips the compilation (a few seconds instead of about a minute):
+
+```yaml
+env:
+  - name: XDG_CACHE_HOME
+    value: /compile-cache
+  - name: TORCHINDUCTOR_CACHE_DIR
+    value: /compile-cache/inductor
+  - name: TRITON_CACHE_DIR
+    value: /compile-cache/triton
+volumes:
+  - name: compile-cache
+    hostPath:
+      path: /mnt/k8s-disks/0/compile-cache
+      type: DirectoryOrCreate
+```
+
+Do not add `--enforce-eager` to the vLLM arguments: it disables `torch.compile` (and CUDA graphs) entirely, so nothing is cached and steady-state throughput drops. If you want new nodes to start warm as well, extend the `model-preloader` DaemonSet to sync `/mnt/k8s-disks/0/compile-cache` to and from an S3 prefix keyed by GPU type, model, tensor-parallel degree and PyTorch version.
+
+### Alternative: stream weights with Run:ai Model Streamer
+
+`streamer/workload-streamer.yaml` is a drop-in alternative to `workload.yaml` that does not stage the weights on disk at all. vLLM loads them with the [Run:ai Model Streamer](https://github.com/run-ai/runai-model-streamer) straight from S3 into GPU memory:
+
+```yaml
+args:
+  - --model=s3://<<MODEL_BUCKET>>/<<MODEL_PATH>>
+  - --load-format=runai_streamer
+  - --model-loader-extra-config={"concurrency":37,"distributed":true}
+  - --tensor-parallel-size=8
+env:
+  - name: RUNAI_STREAMER_CHUNK_BYTESIZE
+    value: "4294967296"
+  - name: RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS
+    value: "3000"
+  - name: RUNAI_STREAMER_S3_LOW_SPEED_LIMIT
+    value: "1048576"
+```
+
+* `concurrency = ceil(model_size_gb / chunk_size_gb)`: 37 for a 145 GB model with the recommended 4 GB chunks (`RUNAI_STREAMER_CHUNK_BYTESIZE`). Recompute it for your model.
+* `distributed: true` makes every tensor-parallel rank stream its own shard instead of rank 0 loading everything and broadcasting. Only set it with `--tensor-parallel-size` greater than 1, and never together with `--enforce-eager`.
+* The timeout and low-speed limit make the streamer retry slow S3 requests quickly.
+
+Choose between the two variants based on how often pods restart on a node:
+
+| | `workload.yaml` (s5cmd to NVMe) | `streamer/workload-streamer.yaml` (Run:ai Model Streamer) |
+| --- | --- | --- |
+| Weights written to disk | Once per node, on the NVMe array | Never |
+| First pod on a new node | Download overlaps with the image pull, then loads at NVMe speed | Streams from S3 while the pod starts |
+| Later pods on the same node | Load from NVMe, no network traffic | Stream from S3 again |
+| Extra components | `model-preloader` DaemonSet | None |
+| Images | Amazon DLC for vLLM | Upstream `vllm/vllm-openai` (ships the streamer extra) |
+
+Both variants keep EBS out of the data path and both need the S3 gateway VPC endpoint to avoid the NAT gateway during scale-out. Deploy the streamer variant with:
+
+```sh
+kubectl delete -f workload.yaml   # optional, frees the GPUs
+kubectl apply -f streamer/
+```
+
 ## Results
 
 Wait for the node, the preloader and the inference pod:
@@ -313,7 +385,7 @@ make test-gpu-fast-model-loading
 To remove all objects created, run the following commands from this folder:
 
 ```sh
-kubectl delete -f .
+kubectl delete -f . -f streamer/
 aws iam delete-role-policy --role-name "$KARPENTER_NODE_IAM_ROLE_NAME" --policy-name gpu-fast-model-loading-s3-read
 ```
 

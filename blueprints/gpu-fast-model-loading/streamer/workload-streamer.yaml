@@ -1,0 +1,121 @@
+# Alternative to workload.yaml: stream the weights from Amazon S3 straight into
+# GPU memory with Run:ai Model Streamer instead of staging them on NVMe with the
+# model-preloader DaemonSet. Nothing is written to disk (EBS or NVMe) for the
+# weights; only the torch.compile cache lands on the NVMe array.
+#
+# This file lives in a sub-folder on purpose so that `kubectl apply -f .` from
+# the blueprint folder does not deploy both variants (each one asks for a full
+# p5.48xlarge). Deploy it with: kubectl apply -f streamer/
+#
+# Settings follow the "Accelerate model loading on Amazon EKS" page of the EKS
+# user guide: 4 GB chunks, concurrency = ceil(model_size_gb / 4) and
+# distributed loading so every tensor-parallel rank streams its own shard.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vllm-streamer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-streamer
+  labels:
+    app: vllm-streamer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-streamer
+  template:
+    metadata:
+      labels:
+        app: vllm-streamer
+    spec:
+      # S3 read access comes from the node role by default; bind an IAM role to
+      # this service account with EKS Pod Identity to scope it down (see README).
+      serviceAccountName: vllm-streamer
+      nodeSelector:
+        intent: gpu-fast-model-loading
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: compile-cache
+          hostPath:
+            path: /mnt/k8s-disks/0/compile-cache
+            type: DirectoryOrCreate
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+      containers:
+        - name: vllm
+          # The upstream vLLM image ships the runai-model-streamer extra. Mirror
+          # it to Amazon ECR so the SOCI parallel pull can use HTTP range requests.
+          image: vllm/vllm-openai:v0.21.0
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model=s3://<<MODEL_BUCKET>>/<<MODEL_PATH>>
+            - --served-model-name=model
+            - --load-format=runai_streamer
+            # concurrency = ceil(model_size_gb / chunk_size_gb); 37 for a 145 GB
+            # model with 4 GB chunks. distributed=true requires TP > 1.
+            - --model-loader-extra-config={"concurrency":37,"distributed":true}
+            - --tensor-parallel-size=8
+            - --host=0.0.0.0
+            - --port=8000
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # Run:ai Model Streamer tuning
+            - name: RUNAI_STREAMER_CHUNK_BYTESIZE
+              value: "4294967296"
+            - name: RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS
+              value: "3000"
+            - name: RUNAI_STREAMER_S3_LOW_SPEED_LIMIT
+              value: "1048576"
+            # torch.compile cache on the NVMe array
+            - name: XDG_CACHE_HOME
+              value: /compile-cache
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /compile-cache/inductor
+            - name: TRITON_CACHE_DIR
+              value: /compile-cache/triton
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: "32"
+              memory: 256Gi
+            limits:
+              nvidia.com/gpu: 8
+          volumeMounts:
+            - name: compile-cache
+              mountPath: /compile-cache
+            - name: shm
+              mountPath: /dev/shm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-streamer
+spec:
+  selector:
+    app: vllm-streamer
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

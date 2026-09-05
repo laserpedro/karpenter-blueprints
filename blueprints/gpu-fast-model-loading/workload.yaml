@@ -25,6 +25,12 @@ spec:
           hostPath:
             path: /mnt/k8s-disks/0/models
             type: DirectoryOrCreate
+        # torch.compile / Triton artifacts, kept on the NVMe array so the next
+        # pod on this node skips the compilation step (~1 min on large models).
+        - name: compile-cache
+          hostPath:
+            path: /mnt/k8s-disks/0/compile-cache
+            type: DirectoryOrCreate
         # NCCL needs a large shared memory segment for tensor parallelism.
         - name: shm
           emptyDir:
@@ -64,13 +70,28 @@ spec:
           ports:
             - name: http
               containerPort: 8000
-          readinessProbe:
+          env:
+            # Persist torch.compile and Triton kernels on the node's NVMe array.
+            - name: XDG_CACHE_HOME
+              value: /compile-cache
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /compile-cache/inductor
+            - name: TRITON_CACHE_DIR
+              value: /compile-cache/triton
+          # Weight loading + torch.compile can take a few minutes on a cold node.
+          startupProbe:
             httpGet:
               path: /health
               port: http
             initialDelaySeconds: 30
             periodSeconds: 10
-            failureThreshold: 60
+            failureThreshold: 90
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
           resources:
             requests:
               cpu: "32"
@@ -81,6 +102,8 @@ spec:
             - name: models
               mountPath: /models
               readOnly: true
+            - name: compile-cache
+              mountPath: /compile-cache
             - name: shm
               mountPath: /dev/shm
 ---
