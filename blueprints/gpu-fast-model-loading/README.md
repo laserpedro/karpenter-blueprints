@@ -11,7 +11,7 @@ This blueprint shows how to configure a Karpenter `EC2NodeClass` and `NodePool` 
 
 * use the **SOCI snapshotter in parallel pull/unpack mode** to download and unpack image layers concurrently,
 * assemble the **local NVMe instance store into a RAID-0 array** that backs containerd, the SOCI snapshotter, kubelet (`emptyDir`) and pod logs, so the EBS root volume only hosts the OS,
-* **download model weights from Amazon S3 straight onto that NVMe array** with a `model-preloader` DaemonSet, in parallel with the image pull, and expose them to the inference pod through a `hostPath` volume.
+* **download model weights from Amazon S3 straight onto that NVMe array** with a `model-preloader` DaemonSet that puts every model listed in a ConfigMap on every node of the pool, in parallel with the image pull, and expose them to the inference pods through a `hostPath` volume.
 
 The pattern follows the AWS Containers blog post [Fast model loading for AI inference on Amazon EKS](https://aws.amazon.com/blogs/containers/fast-model-loading-for-ai-inference-on-amazon-eks/) and the EKS user guide page [Accelerate model loading on Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/ml-inference-fast-model-loading.html), which also covers the torch.compile cache and the Run:ai Model Streamer alternative described below. It builds on the [SOCI snapshotter](/blueprints/soci-snapshotter/) and [NVIDIA GPU workload](/blueprints/nvidia-gpu-workload/) blueprints, which explain each building block in more depth.
 
@@ -38,19 +38,20 @@ The pattern follows the AWS Containers blog post [Fast model loading for AI infe
               +--------------------------+--------------------------+
               |                                                     |
   kubelet pulls vllm image                            model-preloader DaemonSet
-  through SOCI (parallel pull/unpack)                 s5cmd s3://bucket/model/* -> /mnt/k8s-disks/0/models
-  layers unpacked on NVMe                             writes .ready when done
+  through SOCI (parallel pull/unpack)                 for each model in the ConfigMap list:
+  layers unpacked on NVMe                               s5cmd s3://bucket/<model>/* -> /mnt/k8s-disks/0/models/<model>
+              |                                         writes <model>/.ready when done
               |                                                     |
               +--------------------------+--------------------------+
                                          |
-                       vllm pod: init container waits for .ready
-                       main container loads /models/<model> from NVMe into GPU memory
+                       vllm pod: waits for /models/<model>/.ready
+                       then loads the weights from NVMe into GPU memory
 ```
 
 * **Image pull.** The `FastImagePull` feature gate in the `NodeConfig` makes `nodeadm` switch containerd to the SOCI snapshotter and write `/etc/soci-snapshotter-grpc/config.toml` with parallel mode enabled (20 concurrent downloads per image, 16 MB chunks, 12 concurrent unpacks, discard of unpacked layers). Because `/var/lib/soci-snapshotter-grpc` and `/var/lib/containerd` are bind-mounted onto the NVMe array, the download buffers and the unpacked layers never touch EBS.
-* **Model download.** The DaemonSet starts as soon as the node joins the cluster, so the S3 download overlaps with the image pull. It uses [s5cmd](https://github.com/peak/s5cmd), a parallel S3 client that can drive very high throughput on large instances, and writes into `/mnt/k8s-disks/0/models` via a `hostPath` volume. The init container refuses to run if that path is not backed by an `md` RAID device, so you cannot silently fall back to EBS. A `.ready` marker makes the download idempotent: a node that already holds the weights (for example after a pod restart) is not re-downloaded.
+* **Model download.** The DaemonSet starts as soon as the node joins the cluster, so the S3 download overlaps with the image pull. It reads the list of S3 prefixes from the `model-preloader-models` ConfigMap and downloads them one after the other, in list order, with [s5cmd](https://github.com/peak/s5cmd), a parallel S3 client that can drive very high throughput on large instances. Everything lands in `/mnt/k8s-disks/0/models/<prefix>` via a `hostPath` volume. The init container refuses to run if that path is not backed by an `md` RAID device, so you cannot silently fall back to EBS. Each model gets its own `.ready` marker, written only after `s5cmd` succeeded, which makes the download idempotent: a node that already holds a model (for example after a pod restart) skips it, and an interrupted download resumes because `s5cmd sync` only fetches missing or incomplete objects.
 * **Why not EC2 user data?** On AL2023, `nodeadm` assembles the RAID array *after* cloud-init has run the shell scripts from `userData`, so `/mnt/k8s-disks/0` does not exist yet when user data runs ([karpenter-provider-aws#5981](https://github.com/aws/karpenter-provider-aws/issues/5981)). A DaemonSet is the simplest reliable hook that runs once the array is mounted.
-* **Inference pod.** The `vllm` Deployment mounts the same `hostPath` read-only, waits for the `.ready` marker in an init container, then serves the model with tensor parallelism across the 8 GPUs of a `p5.48xlarge`.
+* **Inference pod.** The `vllm` Deployment mounts the same `hostPath` read-only. Its container command waits for the `.ready` marker of the model it serves, then `exec`s vLLM with tensor parallelism across the 8 GPUs of a `p5.48xlarge`. The wait is deliberately inside the container and not in an init container: the kubelet pulls a container's image only when it is about to start that container, so an init container would postpone the 10 GB image pull until the download is over. With the wait in the container, the SOCI image pull and the S3 download really run in parallel, and the pod only becomes Ready once vLLM answers its health check.
 
 ## Deploy
 
@@ -124,7 +125,7 @@ Those commands create the following:
 
 1. `EC2NodeClass` named `gpu-fast-model-loading` with `instanceStorePolicy: RAID0` and the `FastImagePull` feature gate enabled (`nodeclass.yaml`).
 2. `NodePool` named `gpu-fast-model-loading` that only launches `p5`, `p5e` or `p5en` instances with local NVMe, tainted with `nvidia.com/gpu` (`nodepool.yaml`).
-3. `DaemonSet` named `model-preloader` that copies `s3://$MODEL_BUCKET/$MODEL_PATH/` onto the NVMe array of every node in that NodePool (`model-preloader.yaml`).
+3. `ConfigMap` named `model-preloader-models` listing the models to pre-warm (one entry, `s3://$MODEL_BUCKET/$MODEL_PATH`, by default) and `DaemonSet` named `model-preloader` that copies each of them onto the NVMe array of every node in that NodePool (`model-preloader.yaml`).
 4. `Deployment` and `Service` named `vllm` running the Amazon Deep Learning Container for vLLM and serving the model from the NVMe array, with its torch.compile cache on the same array (`workload.yaml`).
 
 The `streamer/` sub-folder holds an alternative workload that streams the weights from S3 straight into GPU memory (see [Alternative: stream weights with Run:ai Model Streamer](#alternative-stream-weights-with-runai-model-streamer)). It is not applied by `kubectl apply -f .` on purpose, since each variant claims a full `p5.48xlarge`.
@@ -237,11 +238,21 @@ See the [reserved-capacity](/blueprints/reserved-capacity/) blueprint for the de
 
 ### model-preloader DaemonSet
 
-The important knobs are environment variables on the `s5cmd` init container:
+The list of models comes from the `model-preloader-models` ConfigMap, one S3 prefix per line:
+
+```yaml
+data:
+  models.txt: |
+    s3://my-models-bucket/models/Qwen2.5-72B-Instruct
+    s3://my-models-bucket/models/Qwen2.5-7B-Instruct
+```
+
+Every node of the pool downloads every listed model, in list order, so put the model whose pods must start first at the top. A prefix `s3://<bucket>/<prefix>` lands in `/mnt/k8s-disks/0/models/<prefix>` and is marked with `<prefix>/.ready`. Adding a line and re-applying the ConfigMap only takes effect on new nodes or after restarting the DaemonSet pods (`kubectl rollout restart daemonset/model-preloader`); existing models are detected by their marker and are not downloaded again.
+
+The remaining knobs are environment variables on the `s5cmd` init container:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `MODEL_BUCKET` / `MODEL_PATH` | placeholders | Source of the weights: `s3://$MODEL_BUCKET/$MODEL_PATH/*` is copied to `/mnt/k8s-disks/0/models/$MODEL_PATH/`. |
 | `REQUIRE_NVME` | `true` | Fail if `/models` is not on an `md` RAID device. Set to `false` only for experiments on EBS-only nodes. |
 | `S5CMD_NUMWORKERS` | `256` | Global worker pool size of `s5cmd`. |
 | `S5CMD_CONCURRENCY` | `16` | Parts downloaded in parallel per object. |
@@ -249,12 +260,15 @@ The important knobs are environment variables on the `s5cmd` init container:
 
 `s5cmd` is a small Go binary distributed as `peakcom/s5cmd` on Docker Hub. For production, mirror the image to Amazon ECR to avoid Docker Hub rate limits and keep pulls inside your VPC. Any other S3 client works too (for example the AWS CLI with its [CRT transfer client](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-options.html#cli-configure-options-s3) or [Mountpoint for Amazon S3](https://github.com/awslabs/mountpoint-s3) with a local cache); the requirement is that it writes to the `hostPath` under `/mnt/k8s-disks/0`.
 
-To serve several models from the same pool, either run one `model-preloader` DaemonSet per model or extend the script to loop over a list of prefixes; every model gets its own `.ready` marker.
+#### Serving several models
+
+Because every node holds every listed model, any inference pod can land on any node of the pool. To serve a second model, add its prefix to the ConfigMap and create a second `Deployment` from `workload.yaml` with a different name, `MODEL` path and, usually, a smaller tensor-parallel degree so that several models share the GPUs of one `p5.48xlarge`. For example two models with `TENSOR_PARALLEL_SIZE=4` and `nvidia.com/gpu: 4` each fit on one node; Karpenter bin-packs the pods and launches a second node only when the first one is full. Keep in mind that each node downloads all models before it is fully warm, and that the downloads share the node's network link, so this shape fits a small, fixed set of co-hosted models. If you want each node to download only the models it actually serves, move the download into the inference pod (a sidecar with a per-model lock on the `hostPath`) or run one NodePool per model.
 
 ### Inference workload
 
-* The vLLM container mounts the same `hostPath` read-only and starts with `--model=/models/$MODEL_PATH`. Loading from the NVMe array into GPU memory runs at local disk speed rather than S3 or EBS speed.
-* `--tensor-parallel-size=8` and `nvidia.com/gpu: 8` match a `p5.48xlarge`. For smaller instances lower both values together (for example `1` on a `g6e.xlarge`) and pick a model that fits in the GPU memory.
+* The vLLM container mounts the same `hostPath` read-only, waits for `/models/$MODEL_PATH/.ready` and then starts vLLM with `--model=/models/$MODEL_PATH`. Loading from the NVMe array into GPU memory runs at local disk speed rather than S3 or EBS speed. On a node that has just written the weights they are usually still in the page cache, so the load runs at memory speed.
+* `MODEL_WAIT_TIMEOUT_SECONDS` (default 1800) bounds the wait. If the preloader never delivers the model, for example because of a wrong bucket name or a missing IAM permission, the container exits with a clear message instead of staying unready forever, and `kubectl logs -l app=model-preloader -c s5cmd` shows the cause. The `startupProbe` is sized to cover the wait plus weight loading and `torch.compile`.
+* `TENSOR_PARALLEL_SIZE=8` and `nvidia.com/gpu: 8` match a `p5.48xlarge`. For smaller instances or several co-hosted models lower both values together (for example `1` on a `g6e.xlarge`) and pick a model that fits in the GPU memory.
 * `/dev/shm` is an in-memory `emptyDir` because NCCL uses shared memory for tensor-parallel communication.
 * If you would rather not use `hostPath`, an `emptyDir` in the inference pod is also on the NVMe array (kubelet's pod directory is bind-mounted onto it) and can be filled by an init container with the same `s5cmd` command. You lose the overlap with the image pull and the reuse across pods on the same node, but avoid host-level access.
 
@@ -344,6 +358,17 @@ Filesystem      Size  Used Avail Use% Mounted on
 Downloading s3://my-models-bucket/models/Qwen2.5-72B-Instruct/ -> /models/models/Qwen2.5-72B-Instruct
 ...
 Downloaded 136G in 71s
+All models ready
+```
+
+Meanwhile the vLLM container was already running its wait loop, which you can see at the top of its logs, followed by the vLLM startup once the marker appeared:
+
+```sh
+> kubectl logs -l app=vllm | head
+waiting for model-preloader to finish downloading /models/models/Qwen2.5-72B-Instruct
+waiting for model-preloader to finish downloading /models/models/Qwen2.5-72B-Instruct
+model ready, starting vLLM
+INFO ... Loading weights took 41.2 seconds
 ```
 
 The image pull events show SOCI parallel mode at work on the ~10 GB vLLM image, in the same range as the [soci-snapshotter](/blueprints/soci-snapshotter/) blueprint measured (about 60 s on AL2023 versus about 112 s with the default snapshotter):

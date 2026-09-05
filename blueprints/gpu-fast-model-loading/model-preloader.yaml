@@ -1,11 +1,27 @@
-# Pre-warms every node of the gpu-fast-model-loading NodePool with the model
-# weights, straight from S3 into the local NVMe RAID-0 array that Karpenter
+# Pre-warms every node of the gpu-fast-model-loading NodePool with one or more
+# models, straight from S3 into the local NVMe RAID-0 array that Karpenter
 # creates (instanceStorePolicy: RAID0). The EBS root volume is never touched.
 #
 # Because this is a DaemonSet, the download starts the moment the node joins the
 # cluster and overlaps with the (SOCI-accelerated) pull of the inference image.
 # Running the download from EC2 user data is not an option: on AL2023 the RAID
 # array is assembled by nodeadm *after* cloud-init has run the user data scripts.
+#
+# Every node of the pool receives every model listed in the ConfigMap below.
+# Models are downloaded one after the other, in list order, and each one gets
+# its own ".ready" marker so inference pods only wait for the model they serve.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-preloader-models
+data:
+  # One S3 prefix per line, first line downloaded first. Lines starting with #
+  # are ignored. Each prefix is copied to /mnt/k8s-disks/0/models/<prefix
+  # without the bucket name>, e.g. s3://my-bucket/models/foo -> /models/models/foo
+  models.txt: |
+    s3://<<MODEL_BUCKET>>/<<MODEL_PATH>>
+    # s3://<<MODEL_BUCKET>>/models/Qwen2.5-7B-Instruct
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -46,6 +62,9 @@ spec:
             # store NVMe disks by nodeadm when instanceStorePolicy is RAID0.
             path: /mnt/k8s-disks/0/models
             type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: model-preloader-models
       initContainers:
         - name: s5cmd
           # s5cmd is a parallel S3 client that can saturate the instance network
@@ -55,7 +74,6 @@ spec:
           args:
             - |
               set -eu
-              DEST="/models/${MODEL_PATH}"
               # Refuse to run if /models is not backed by the NVMe RAID array.
               if [ "${REQUIRE_NVME}" = "true" ] && ! grep -qE '^/dev/md[0-9]+ /models ' /proc/mounts; then
                 echo "ERROR: /models is not on the local NVMe RAID-0 array (instanceStorePolicy: RAID0 missing or instance without NVMe)"
@@ -64,25 +82,31 @@ spec:
               fi
               echo "Local NVMe storage backing /models:"
               df -h /models
-              if [ -f "${DEST}/.ready" ]; then
-                echo "Model already present in ${DEST}, skipping download"
-                exit 0
-              fi
-              mkdir -p "${DEST}"
-              echo "Downloading s3://${MODEL_BUCKET}/${MODEL_PATH}/ -> ${DEST}"
-              START=$(date +%s)
-              /s5cmd --numworkers "${S5CMD_NUMWORKERS}" --stat cp \
-                --concurrency "${S5CMD_CONCURRENCY}" --part-size "${S5CMD_PART_SIZE_MB}" \
-                "s3://${MODEL_BUCKET}/${MODEL_PATH}/*" "${DEST}/"
-              END=$(date +%s)
-              SIZE=$(du -sh "${DEST}" | cut -f1)
-              echo "Downloaded ${SIZE} in $((END-START))s"
-              touch "${DEST}/.ready"
+              while read -r line; do
+                case "${line}" in ''|'#'*) continue ;; esac
+                SRC="${line%/}"
+                PREFIX="${SRC#s3://}"
+                PREFIX="${PREFIX#*/}"
+                DEST="/models/${PREFIX}"
+                if [ -f "${DEST}/.ready" ]; then
+                  echo "Model already present in ${DEST}, skipping download"
+                  continue
+                fi
+                mkdir -p "${DEST}"
+                echo "Downloading ${SRC}/ -> ${DEST}"
+                START=$(date +%s)
+                # sync (instead of cp) only fetches objects that are missing or
+                # have a different size, so an interrupted download resumes.
+                /s5cmd --numworkers "${S5CMD_NUMWORKERS}" --stat sync --size-only \
+                  --concurrency "${S5CMD_CONCURRENCY}" --part-size "${S5CMD_PART_SIZE_MB}" \
+                  "${SRC}/*" "${DEST}/"
+                END=$(date +%s)
+                SIZE=$(du -sh "${DEST}" | cut -f1)
+                echo "Downloaded ${SIZE} in $((END-START))s"
+                touch "${DEST}/.ready"
+              done < /config/models.txt
+              echo "All models ready"
           env:
-            - name: MODEL_BUCKET
-              value: "<<MODEL_BUCKET>>"
-            - name: MODEL_PATH
-              value: "<<MODEL_PATH>>"
             - name: REQUIRE_NVME
               value: "true"
             # Tune for your instance size. p5.48xlarge has 192 vCPUs and a very
@@ -100,6 +124,9 @@ spec:
           volumeMounts:
             - name: models
               mountPath: /models
+            - name: config
+              mountPath: /config
+              readOnly: true
       containers:
         # DaemonSet pods must stay Running; the actual work happens in the init container.
         - name: pause
