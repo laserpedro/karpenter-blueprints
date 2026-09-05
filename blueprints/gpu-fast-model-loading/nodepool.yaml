@@ -1,0 +1,53 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-fast-model-loading
+spec:
+  # Two p5.48xlarge worth of GPUs. Raise this together with your capacity.
+  limits:
+    nvidia.com/gpu: 16
+  disruption:
+    # GPU inference nodes are expensive to warm up (image pull + model download),
+    # so only remove them once they are empty, and give scale-in some slack.
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 10m
+  template:
+    metadata:
+      labels:
+        intent: gpu-fast-model-loading
+    spec:
+      expireAfter: 720h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu-fast-model-loading
+      requirements:
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        # p5 family (8x NVIDIA H100/H200, 8x 3.84 TB local NVMe). Add other GPU
+        # families that ship local NVMe (p4d, p4de, g6e, g6, g5, ...) if you want
+        # Karpenter to fall back to them.
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["p5", "p5e", "p5en"]
+        - key: karpenter.k8s.aws/instance-gpu-manufacturer
+          operator: In
+          values: ["nvidia"]
+        # Never launch an instance without local NVMe: the whole point of this
+        # blueprint is to keep images and model weights off EBS.
+        - key: karpenter.k8s.aws/instance-local-nvme
+          operator: Exists
+        # p5 capacity is usually purchased through On-Demand Capacity
+        # Reservations or EC2 Capacity Blocks for ML. Add "reserved" here and a
+        # capacityReservationSelectorTerms block to the EC2NodeClass to consume
+        # them first (see the reserved-capacity blueprint).
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule

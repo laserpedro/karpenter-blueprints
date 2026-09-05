@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  labels:
+    app: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      nodeSelector:
+        intent: gpu-fast-model-loading
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: models
+          hostPath:
+            path: /mnt/k8s-disks/0/models
+            type: DirectoryOrCreate
+        # NCCL needs a large shared memory segment for tensor parallelism.
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+      initContainers:
+        # Block until the model-preloader DaemonSet has finished writing the
+        # weights to the local NVMe array. Image pull (SOCI) and model download
+        # (s5cmd) run in parallel; whichever finishes last gates the start.
+        - name: wait-for-model
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023-minimal
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until [ -f "/models/<<MODEL_PATH>>/.ready" ]; do
+                echo "waiting for model-preloader to finish downloading /models/<<MODEL_PATH>>"
+                sleep 5
+              done
+              echo "model ready"
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+      containers:
+        - name: vllm
+          # Amazon Deep Learning Container for vLLM (~10 GB), the same image used
+          # in the soci-snapshotter blueprint.
+          image: 763104351884.dkr.ecr.us-east-1.amazonaws.com/vllm:0.9-gpu-py312-ec2
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model=/models/<<MODEL_PATH>>
+            - --served-model-name=model
+            # One shard per GPU of a p5.48xlarge. Adjust to the number of GPUs you request below.
+            - --tensor-parallel-size=8
+            - --host=0.0.0.0
+            - --port=8000
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: "32"
+              memory: 256Gi
+            limits:
+              nvidia.com/gpu: 8
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+spec:
+  selector:
+    app: vllm
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

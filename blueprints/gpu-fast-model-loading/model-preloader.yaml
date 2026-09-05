@@ -1,0 +1,101 @@
+# Pre-warms every node of the gpu-fast-model-loading NodePool with the model
+# weights, straight from S3 into the local NVMe RAID-0 array that Karpenter
+# creates (instanceStorePolicy: RAID0). The EBS root volume is never touched.
+#
+# Because this is a DaemonSet, the download starts the moment the node joins the
+# cluster and overlaps with the (SOCI-accelerated) pull of the inference image.
+# Running the download from EC2 user data is not an option: on AL2023 the RAID
+# array is assembled by nodeadm *after* cloud-init has run the user data scripts.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: model-preloader
+  labels:
+    app: model-preloader
+spec:
+  selector:
+    matchLabels:
+      app: model-preloader
+  template:
+    metadata:
+      labels:
+        app: model-preloader
+    spec:
+      nodeSelector:
+        intent: gpu-fast-model-loading
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      # Start before regular workloads so the weights are ready as early as possible.
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 5
+      volumes:
+        - name: models
+          hostPath:
+            # /mnt/k8s-disks/0 is the XFS RAID-0 array built from the instance
+            # store NVMe disks by nodeadm when instanceStorePolicy is RAID0.
+            path: /mnt/k8s-disks/0/models
+            type: DirectoryOrCreate
+      initContainers:
+        - name: s5cmd
+          # s5cmd is a parallel S3 client that can saturate the instance network
+          # link. Mirror this image to your own registry for production use.
+          image: peakcom/s5cmd:v2.3.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              DEST="/models/${MODEL_PATH}"
+              # Refuse to run if /models is not backed by the NVMe RAID array.
+              if [ "${REQUIRE_NVME}" = "true" ] && ! grep -qE '^/dev/md[0-9]+ /models ' /proc/mounts; then
+                echo "ERROR: /models is not on the local NVMe RAID-0 array (instanceStorePolicy: RAID0 missing or instance without NVMe)"
+                grep ' /models ' /proc/mounts || true
+                exit 1
+              fi
+              echo "Local NVMe storage backing /models:"
+              df -h /models
+              if [ -f "${DEST}/.ready" ]; then
+                echo "Model already present in ${DEST}, skipping download"
+                exit 0
+              fi
+              mkdir -p "${DEST}"
+              echo "Downloading s3://${MODEL_BUCKET}/${MODEL_PATH}/ -> ${DEST}"
+              START=$(date +%s)
+              /s5cmd --numworkers "${S5CMD_NUMWORKERS}" --stat cp \
+                --concurrency "${S5CMD_CONCURRENCY}" --part-size "${S5CMD_PART_SIZE_MB}" \
+                "s3://${MODEL_BUCKET}/${MODEL_PATH}/*" "${DEST}/"
+              END=$(date +%s)
+              SIZE=$(du -sh "${DEST}" | cut -f1)
+              echo "Downloaded ${SIZE} in $((END-START))s"
+              touch "${DEST}/.ready"
+          env:
+            - name: MODEL_BUCKET
+              value: "<<MODEL_BUCKET>>"
+            - name: MODEL_PATH
+              value: "<<MODEL_PATH>>"
+            - name: REQUIRE_NVME
+              value: "true"
+            # Tune for your instance size. p5.48xlarge has 192 vCPUs and a very
+            # fast network, so we can afford a lot of parallelism.
+            - name: S5CMD_NUMWORKERS
+              value: "256"
+            - name: S5CMD_CONCURRENCY
+              value: "16"
+            - name: S5CMD_PART_SIZE_MB
+              value: "64"
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      containers:
+        # DaemonSet pods must stay Running; the actual work happens in the init container.
+        - name: pause
+          image: public.ecr.aws/eks-distro/kubernetes/pause:v1.33.0-eks-1-33-4
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi

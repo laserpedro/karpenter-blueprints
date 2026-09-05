@@ -1,0 +1,58 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu-fast-model-loading
+spec:
+  # "al2023@latest" resolves to the EKS-optimized *accelerated* AL2023 AMI (NVIDIA
+  # driver + container toolkit pre-installed) whenever the NodePool picks a GPU
+  # instance type such as p5.48xlarge. SOCI snapshotter ships with that AMI.
+  amiSelectorTerms:
+    - alias: al2023@latest
+  role: "<<KARPENTER_NODE_IAM_ROLE_NAME>>"
+  # RAID0 makes nodeadm build one XFS RAID-0 array (/dev/md/0) out of every local
+  # NVMe instance-store disk and mount it at /mnt/k8s-disks/0. nodeadm then
+  # bind-mounts /var/lib/containerd, /var/lib/soci-snapshotter-grpc,
+  # /var/lib/kubelet and /var/log/pods onto that array, so container image
+  # layers, SOCI download buffers, emptyDir volumes and pod logs all live on
+  # local NVMe instead of the EBS root volume.
+  instanceStorePolicy: RAID0
+  blockDeviceMappings:
+    # With RAID0 the EBS root volume only hosts the OS, so a modest gp3 volume is
+    # enough. Bump throughput/iops if you disable RAID0 or run without NVMe.
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        throughput: 600
+        iops: 6000
+        encrypted: true
+        deleteOnTermination: true
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "<<CLUSTER_NAME>>"
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "<<CLUSTER_NAME>>"
+  tags:
+    intent: gpu-fast-model-loading
+  userData: |
+    MIME-Version: 1.0
+    Content-Type: multipart/mixed; boundary="BOUNDARY"
+
+    --BOUNDARY
+    Content-Type: application/node.eks.aws
+
+    ---
+    apiVersion: node.eks.aws/v1alpha1
+    kind: NodeConfig
+    spec:
+      featureGates:
+        # Switches containerd to the SOCI snapshotter in parallel pull/unpack
+        # mode. nodeadm writes /etc/soci-snapshotter-grpc/config.toml with
+        # max_concurrent_downloads_per_image = 20, concurrent_download_chunk_size
+        # = "16mb", max_concurrent_unpacks_per_image = 12 and
+        # discard_unpacked_layers = true, which are the values recommended for
+        # Amazon ECR. See the README for how to override them.
+        FastImagePull: true
+
+    --BOUNDARY--
